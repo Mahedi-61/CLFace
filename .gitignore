@@ -1,0 +1,9 @@
+**/logs
+**/logs*
+**/data/*
+**/checkpoints
+**/samples*
+*.zip
+**/saved_models/*
+__pycache__/
+!.gitignore
