@@ -5,16 +5,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F 
-from torchvision import transforms
 import os, random  
-
-from utils.utils import load_base_model, load_shared_model
-from models import net
-from models.ir_resnet import iresnet18
-from utils.dataset_utils import *
+from tqdm import tqdm 
 
 ROOT_PATH = osp.abspath(osp.join(osp.dirname(osp.abspath(__file__)),  ".."))
 sys.path.insert(0, ROOT_PATH)
+
+from utils.utils import load_base_model, load_shared_model, load_full_model
+from models import net
+from models.ir_resnet import iresnet18
+from models.metrics import ArcMarginProduct
+from models.models import AdaFace
+my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class RandomApply(nn.Module):
@@ -27,48 +29,90 @@ class RandomApply(nn.Module):
         return x if random.random() > self.p else self.fn(x)
 
 
-def get_dataset_specific_transform(args, train=True):
-    if args.dataset_name == "cifar100" and train == True:
-        trans = transforms.Compose([
-        transforms.Pad(2),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.RandomHorizontalFlip(p=0.5),
-        #RandomApply(transforms.GaussianBlur((3, 3), (1.5, 1.5)), p=0.1),
-        transforms.RandomCrop(args.img_size),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=torch.tensor([0.485, 0.456, 0.406]),
-            std=torch.tensor([0.229, 0.224, 0.225]))
-        ])
 
-    elif args.dataset_name == "cifar100" and train == False:
-        trans = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=torch.tensor([0.485, 0.456, 0.406]),
-            std=torch.tensor([0.229, 0.224, 0.225]))
-        ])
-    
+def pod_loss(
+    list_attentions_a,
+    list_attentions_b,
+    collapse_channels="spatial",
+    normalize=True,
+    **kwargs):
+    """Pooled Output Distillation.
+    Reference:
+        * Douillard et al.
+          Small Task Incremental Learning.
+          arXiv 2020.
+
+    :param list_attentions_a: A list of attention maps, each of shape (b, n, w, h).
+    :param list_attentions_b: A list of attention maps, each of shape (b, n, w, h).
+    :param collapse_channels: How to pool the channels.
+    :return: A float scalar loss.
+    """
+    assert len(list_attentions_a) == len(list_attentions_b)
+
+    loss = torch.tensor(0.).to(my_device)
+    #for i, (a, b) in enumerate(zip(list_attentions_a, list_attentions_b)):
+        # shape of (b, n, w, h)
+    a = list_attentions_a
+    b = list_attentions_b
+
+    assert a.shape == b.shape, (a.shape, b.shape)
+
+    a = torch.pow(a, 2)
+    b = torch.pow(b, 2)
+
+    if collapse_channels == "channels":
+        a = a.sum(dim=1).view(a.shape[0], -1)  # shape of (b, w * h)
+        b = b.sum(dim=1).view(b.shape[0], -1)
+
+    elif collapse_channels == "width":
+        a = a.sum(dim=2).view(a.shape[0], -1)  # shape of (b, c * h)
+        b = b.sum(dim=2).view(b.shape[0], -1)
+
+    elif collapse_channels == "height":
+        a = a.sum(dim=3).view(a.shape[0], -1)  # shape of (b, c * w)
+        b = b.sum(dim=3).view(b.shape[0], -1)
+
+    elif collapse_channels == "gap":
+        a = F.adaptive_avg_pool2d(a, (1, 1))[..., 0, 0]
+        b = F.adaptive_avg_pool2d(b, (1, 1))[..., 0, 0]
+
+    elif collapse_channels == "spatial":
+        a_h = a.sum(dim=3).view(a.shape[0], -1)
+        b_h = b.sum(dim=3).view(b.shape[0], -1)
+        a_w = a.sum(dim=2).view(a.shape[0], -1)
+        b_w = b.sum(dim=2).view(b.shape[0], -1)
+        a = torch.cat([a_h, a_w], dim=-1)
+        b = torch.cat([b_h, b_w], dim=-1)
     else:
-        trans = None 
-    return trans 
+        raise ValueError("Unknown method to collapse: {}".format(collapse_channels))
 
+    if normalize:
+        a = F.normalize(a, dim=1, p=2)
+        b = F.normalize(b, dim=1, p=2)
+
+    layer_loss = torch.mean(torch.frobenius_norm(a - b, dim=-1))
+    loss = layer_loss #+
+
+    return loss / len(list_attentions_a)
+
+
+def get_gpkd(global_feats, global_feats_old):
+    global_feats = F.normalize(global_feats, p=2, dim=0)
+    global_feats_old = F.normalize(global_feats_old, p=2, dim=0)
+
+    return nn.CosineEmbeddingLoss()(global_feats, 
+                                    global_feats_old.detach(), 
+                                    torch.ones(global_feats.shape[0]).to(my_device)) 
+
+    
 
 ############   features   ############
-def get_features_arcface(model, imgs):
-    img_features = model(imgs)
-    return img_features
-
 def get_shared_features_arcface(backbone, shared_net, imgs):
     x = backbone(imgs)
     img_features = shared_net(x)
     feat = shared_net.module[0](x)
     feat.requires_grad_(True) 
     return img_features, feat 
-
-def get_features_adaface(model, imgs):
-    _, img_features, norm = model(imgs)
-    return img_features, _, norm 
 
 
 def get_tpr(fprs, tprs):
@@ -81,7 +125,56 @@ def get_tpr(fprs, tprs):
     return tpr_fpr_row
 
 
-################## scores ####################
+def valid_epoch(valid_dl, model, args):
+    model.eval()
+    preds = []
+    labels = []
+
+    loop = tqdm(total = len(valid_dl))
+    cosine_sim = nn.CosineSimilarity(dim=1, eps=1e-6)
+
+    with torch.no_grad():
+        for  data in valid_dl:
+            img1, img2, img1_h, img2_h, pair_label = data 
+            
+            img1 = img1.to(my_device)
+            img2 = img2.to(my_device)
+
+            img1_h = img1_h.to(my_device)
+            img2_h = img2_h.to(my_device)
+            pair_label = pair_label.to(my_device)
+
+            # get global and local image features from COTS model
+            if args.model_type == "arcface":
+                global_feat1, local_3 = model(img1)
+                global_feat2, local_3 = model(img2)
+
+                global_feat1_h, local_3  = model(img1_h)
+                global_feat2_h, local_3  = model(img2_h)
+
+            elif args.model_type == "adaface":
+                global_feat1,  _, norm = model(img1)
+                global_feat2,  _, norm = model(img2)
+
+                global_feat1_h,  _, norm = model(img1_h)
+                global_feat2_h,  _, norm = model(img2_h)
+
+            gf1 = torch.cat((global_feat1, global_feat1_h), dim=1)
+            gf2 = torch.cat((global_feat2, global_feat2_h), dim=1)
+
+            pred = cosine_sim(gf1, gf2)
+            preds += pred.data.cpu().tolist()
+            labels += pair_label.data.cpu().tolist()
+
+            # update loop information
+            loop.update(1)
+            loop.set_postfix()
+
+    loop.close()
+    acc, _ = calculate_acc(preds, labels, args)
+    return acc 
+    
+
 def calculate_scores(y_score, y_true, args):
     # sklearn always takes (y_true, y_pred)
     fprs, tprs, threshold = metrics.roc_curve(y_true, y_score)
@@ -100,7 +193,6 @@ def calculate_scores(y_score, y_true, args):
         with open(os.path.join(data_dir, args.roc_file + '.npy'), 'wb') as f:
             np.save(f, y_true)
             np.save(f, y_score)
-
 
 
 def calculate_identification_acc(preds, labels, args):
@@ -126,42 +218,76 @@ def calculate_identification_acc(preds, labels, args):
 
 
 ###########   model   ############
-"""
-# no pretrain for CL learning. (set it always False in cfg file)
-if args.is_pretrain == True:
-    model_path = args.arcface_pretrain_path
-    weights = torch.load(model_path)
-    model.load_state_dict(weights)
-    print("Loading pretrianed ArcFace model")
-"""
-def prepare_arcface_base(args):
-    device = args.device
+def prepare_arcface(args, ):
     model = iresnet18(pretrained=False, progress=True)
+    model.to(my_device)
 
-    model.to(device)
-    model = torch.nn.DataParallel(model, device_ids=args.gpu_id)
+    if args.is_base == True:
+        print("Backbone network (fully trainable + No pretrain weights)")
+
+    elif args.is_base == False:
+        checkpoint = torch.load(args.model_path)
+        model.load_state_dict(checkpoint['model'])
+        print("Loading saved backbone network weights from: ", args.model_path)
+
     return model
 
 
-def prepare_arcface(args):
-    device = args.device
-    model = iresnet18(pretrained=False, progress=True)
+def prepare_margin(args, ):
+    if args.model_type == "arcface":
+        metric_fc = ArcMarginProduct(args.final_dim, 
+                                        args.base_num, 
+                                        s= args.s, 
+                                        margin= args.m)
 
-    # base weights for CL learning. (set it False in cfg file while training base)
+    elif args.model_type == "adaface":
+        metric_fc = AdaFace(embedding_size = args.final_dim, 
+                            classnum = args.base_num) 
+
+    metric_fc.to(my_device)
+
+    if args.is_base == True:
+        print("ArcFace network (fully trainable + No pretrain weights)")
+
+    elif args.is_base == False:
+        checkpoint = torch.load(args.model_path)
+        metric_fc.load_state_dict(checkpoint['metric_fc'])
+        print("Loading saved metric_fc weights from: ", args.model_path)
+
+    return metric_fc
+
+
+
+def prepare_adaface(args):
+    architecture = "ir_18"
+    model = net.build_model(architecture)
+    model.to(my_device)
+    print("AdaFace network (fully trainable + No pretrain weights)")
+    return model
+
+
+def prepare_adaface_pretrained(args):
+    architecture = "ir_18"
+    model = net.build_model(architecture)
+    
+    # base weights for CL learning.
     if args.is_base == True:
         model_path = args.arcface_base_path
         model = load_base_model(model, model_path)
         print("Loading base weights")
+    
+    elif args.is_base == False:
+        model_path = args.arcface_full_model_path
+        model = load_full_model(model, model_path)
+        print("Loading full model weights from: ", args.arcface_full_model_path)
 
-    model.to(device)
-    model = torch.nn.DataParallel(model, device_ids=args.gpu_id)
-    for p in model.parameters():
-        p.requires_grad = False
+    model.to(my_device)
     return model 
 
 
+
+
 def prepare_arcface_shared(args):
-    device = args.device
     model = iresnet18(pretrained=False, progress=True)
 
     model_path = args.arcface_base_path
@@ -175,8 +301,7 @@ def prepare_arcface_shared(args):
     shared_net = nn.Sequential(*[*list(model.children())[6:9], 
                  nn.Flatten(), *list(model.children())[start_layer:]])
 
-    base_net.to(device)
-    base_net = torch.nn.DataParallel(base_net, device_ids=args.gpu_id)
+    base_net.to(my_device)
     for p in base_net.parameters():
         p.requires_grad = False
 
@@ -193,8 +318,7 @@ def prepare_arcface_shared(args):
         for p in shared_net.parameters():
             p.requires_grad = True
     
-    shared_net.to(device)
-    shared_net = torch.nn.DataParallel(shared_net, device_ids=args.gpu_id)
+    shared_net.to(my_device)
     return base_net, shared_net 
 
 
@@ -248,8 +372,7 @@ def grad_cam_loss(feature_o, out_o, feature_n, out_n):
 
 
 #### model for Ada Face 
-def prepare_adaface(args):
-    device = args.device
+def prepare_adaface_vjal(args):
     architecture = "ir_18"
 
     args.load_model_path = args.adaface_path 
@@ -259,13 +382,74 @@ def prepare_adaface(args):
     model_statedict = {key[6:]:val for key, val in statedict.items() if key.startswith('model.')}
     model.load_state_dict(model_statedict)
     
-    model.to(device)
-    model = torch.nn.DataParallel(model, device_ids=args.gpu_id)
+    model.to(my_device)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
     print("Loading pretrianed AdaFace model")
     return model 
+
+
+def KFold(n, n_folds=10):
+    folds = []
+    base = list(range(n))
+    for i in range(n_folds):
+        frac = int(n/n_folds)
+        test = base[i * frac : (i + 1) * frac]
+        train = list(set(base) - set(test))
+        folds.append([train, test])
+    return folds
+
+
+def eval_acc(threshold, diff):
+    y_true = []
+    y_predict = []
+    for d in diff:
+        same = 1 if float(d[0]) > threshold else 0
+        y_predict.append(same)
+        y_true.append(int(d[1]))
+    y_true = np.array(y_true)
+    y_predict = np.array(y_predict)
+    accuracy = 1.0 * np.count_nonzero(y_true == y_predict) / len(y_true)
+    return accuracy
+
+
+def find_best_threshold(thresholds, predicts):
+    best_threshold = best_acc = 0
+    for threshold in thresholds:
+        accuracy = eval_acc(threshold, predicts)
+        if accuracy >= best_acc:
+            best_acc = accuracy
+            best_threshold = threshold
+    return best_threshold
+
+
+def calculate_acc(preds, labels, args):
+    predicts = []
+    num_imgs = len(preds)
+    with torch.no_grad():
+        for i in range(num_imgs):
+
+            #distance = f1.dot(f2) / (f1.norm() * f2.norm() + 1e-5)
+            predicts.append('{}\t{}\n'.format(preds[i], labels[i]))
+
+    accuracy = []
+    thd = []
+    folds = KFold(n=num_imgs, n_folds=10)
+    thresholds = np.arange(-1.0, 1.0, 0.01)
+    predicts = np.array(list(map(lambda line: line.strip('\n').split(), predicts)))
+
+    print(len(predicts))
+    print("starting fold ....")
+    for idx, (train, test) in enumerate(folds):
+        best_thresh = find_best_threshold(thresholds, predicts[train])
+        accuracy.append(eval_acc(best_thresh, predicts[test]))
+        thd.append(best_thresh)
+        #print("finding fold: ", idx)
+
+    print('ACC={:.4f} std={:.4f} thd={:.4f}'.format(np.mean(accuracy), 
+                                np.std(accuracy), np.mean(thd)))
+    return np.mean(accuracy), predicts
 
 
 

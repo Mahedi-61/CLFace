@@ -1,7 +1,7 @@
-CONFIG_NAME: test  #base, full_frozen, shared, test
+CONFIG_NAME: JT #base, shared, test
 dataset_name: lfw 
-class_range: 287 #287
-total_step: 10 #10
+class_range: 2870 #287
+total_step: 1 #10
 
 # machine setup 
 num_workers: 4 
@@ -27,8 +27,7 @@ lr_shared_training: [2, 8, 11]
 lr_shared_layer: 0.0001 #1e-4
 temperature: 2
 
-
-# training settings 
+# objective function 
 lr_image_train: 0.1   #0.1 for ArcFace
 gamma: 0.1  #0.5
 weight_decay: 0.0001 #0.0005 for base, 0.0001 for IL
@@ -37,6 +36,7 @@ KD: 8
 kl_div: 550
 att_distill: 2 
 
+# training settings 
 max_epoch: 12  #15
 batch_size: 128  
 valid_interval: 1
@@ -66,8 +66,9 @@ arcface_pretrain_path: ./weights/pretrain/arcface_ir18_ms1mv3.pth
 adaface_pretrain_path: ./weights/pretrain/adaface_ir18_webface4m.ckpt
 
 # base = True for base training
-is_base: True 
+is_base: False  
 arcface_base_path: ./weights/lfw/base/arcface_ir18.pth
 adaface_base_path: ./weights/lfw/base/adaface_ir18.pth
 
 arcface_test_path: ./checkpoints/lfw/shared/arcface/arcface_ir18.pth
+arcface_full_model_path: ./checkpoints/lfw/JT/arcface/best.pth 

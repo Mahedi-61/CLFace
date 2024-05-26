@@ -103,7 +103,7 @@ class IResNet(nn.Module):
         self.bn2 = nn.BatchNorm2d(512 * block.expansion, eps=1e-05,)
         self.dropout = nn.Dropout(p=dropout, inplace=True)
         self.fc = nn.Linear(512 * block.expansion * self.fc_scale, num_features)
-        self.fc_cifar100 = nn.Linear(2048, 512)
+
 
         self.features = nn.BatchNorm1d(num_features, eps=1e-05)
         nn.init.constant_(self.features.weight, 1.0)
@@ -155,19 +155,16 @@ class IResNet(nn.Module):
             x = self.layer1(x)
             x = self.layer2(x)
             x = self.layer3(x)
+            local_3 = x
             x = self.layer4(x)
             x = self.bn2(x)
             x.requires_grad_(True)
             x = torch.flatten(x, 1)
             x = self.dropout(x)
 
-        if x.shape[1] == 2048: 
-            x = self.fc_cifar100(x.float() if self.fp16 else x) #for cifar100, 32x32 images
-        else: 
-            x = self.fc(x.float() if self.fp16 else x)
-            
+        x = self.fc(x.float() if self.fp16 else x)
         x = self.features(x)
-        return x
+        return x, local_3 
 
 
 def _iresnet(arch, block, layers, pretrained, progress, **kwargs):
@@ -204,6 +201,8 @@ def iresnet200(pretrained=False, progress=True, **kwargs):
 
 
 if __name__ == "__main__":
-    x = torch.randn((16, 3, 32, 32))
+    x = torch.randn((16, 3, 112, 112))
     net = iresnet18()
-    y = net(x)
+    y, local = net(x)
+    print(y.size())
+    print(local.size())

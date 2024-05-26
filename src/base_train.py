@@ -1,240 +1,208 @@
-import sys 
+import os, sys
 import os.path as osp
-import os 
-import random
-import argparse
-import numpy as np
-import pprint
 import torch
+import numpy as np
+import torch
+from tqdm import tqdm 
 import copy
 
 ROOT_PATH = osp.abspath(osp.join(osp.dirname(osp.abspath(__file__)),  ".."))
 sys.path.insert(0, ROOT_PATH)
-from utils.utils import  merge_args_yaml
-from utils.train_dataset import FacescrubClsDataset
-from utils.utils import save_base_model, save_model   
+from utils.dataset import TrainDataset, TestDataset
 from models import focal_loss
-from models.metrics import ArcMarginProduct
 from utils.modules import * 
-from models.models import AdaFace
-import torch.nn.functional as F 
+
+my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def parse_args():
-    """
-    Training settings
-    * This file supports base training of all datasets
-    * Change the cfg file for specific dataset
-    For Multitask (MT) choose same part to train and test
-    """
-    parser = argparse.ArgumentParser(description='Compatible with all datasets for base training')
-
-    parser.add_argument('--cfg', dest='cfg_file', type=str, 
-                        default='./cfg/cifar100.yml',
-                        help='optional config file')
-    args = parser.parse_args()
-    return args
-
-
-def get_loss(args):
-    if args.model_type == "arcface":
-        criterion = focal_loss.FocalLoss(gamma=2)
-
-    elif args.model_type == "adaface":
-        criterion = torch.nn.CrossEntropyLoss()
-
-    return criterion
-
-
-def get_margin(args):
-    #cuda + parallel
-    if args.model_type == "arcface":
-        metric_fc = ArcMarginProduct(args.final_dim, 
-                                     args.num_classes, 
-                                     s=args.s, 
-                                     m=args.m, 
-                                     easy_margin=args.easy_margin)
-
-    elif args.model_type == "adaface":
-        metric_fc = AdaFace(embedding_size = args.final_dim, 
-                            classnum = args.num_classes) 
-
-    metric_fc.to(args.device)
-    metric_fc = torch.nn.DataParallel(metric_fc, device_ids=args.gpu_id)
-    return metric_fc
-
-
-def get_optimizer(args, model, metric_fc):
-    #params = {"params": itertools.chain(*[model.parameters(), metric_fc.parameters()])}
-    params = [{'params': model.parameters()}, {'params': metric_fc.parameters()}]
-
-    if args.optimizer == 'sgd':
-        print("loading sgd")
+class BaseTrainer:
+    def __init__(self, args):
+        self.args = args
+        num = args.num_classes // 2 
+        self.base_num = num - (num % args.step_size)
+        self.class_range = self.base_num // args.step_size 
         
-        optimizer = torch.optim.SGD(params, 
-                            lr = args.lr_image_train, 
-                            momentum= args.momentum, 
-                            weight_decay= args.weight_decay)
+        self.args.base_num = self.base_num
+        self.args.class_range = self.class_range
+        self.val_acc = 0
+
+        # by design
+        if self.args.is_base: 
+            self.args.step = 0
+            self.args.freeze = 0
+
+        self.get_dataloaders()
+
+        if self.args.model_type == "arcface":
+            self.criterion = focal_loss.FocalLoss(gamma=2)
+            self.model = prepare_arcface(self.args)
+
+        elif self.args.model_type == "adaface":
+            self.criterion = torch.nn.CrossEntropyLoss()
+            self.model = prepare_adaface(self.args) 
+
+        self.metric_fc = prepare_margin(self.args)
+        self.get_optimizer()    
+
+
+    def save_model(self, ):
+        save_dir = os.path.join(self.args.checkpoint_path, 
+                                self.args.dataset, 
+                                self.args.setup,
+                                str(self.args.step_size),
+                                "step%d" % self.args.step)
         
-    elif args.optimizer == 'adam':
-        optimizer = torch.optim.AdamW(params, lr = args.lr_image_train, betas=(0.9, 0.999), weight_decay=0.01)
+        os.makedirs(save_dir, exist_ok=True)
 
-    return optimizer
-
-
-def get_all_valid_loaders():
-    trans = get_dataset_specific_transform(args, train=False)
-    valid_ds = FacescrubClsDataset(transform=trans, split="base_valid", step=0, args=args)
-    args.valid_size = valid_ds.__len__()
-   
-    valid_dl = torch.utils.data.DataLoader(
-        valid_ds, 
-        batch_size=args.batch_size, 
-        drop_last=False,
-        num_workers=args.num_workers, 
-        shuffle=False)
-
-    return valid_dl
-
-
-
-def train_epoch(train_dl, 
-                model, 
-                metric_fc, 
-                criterion, 
-                optimizer, 
-                args):
-    """
-    Training scheme for a epoch
-    """
-    device = args.device
-    metric_fc.train()
-    model.train()
-    total_loss = 0
-
-    for imgs, label in train_dl:
-
-        # load cuda
-        imgs = imgs.to(device).requires_grad_()
-        label = label.to(device)
+        name = '%s_18_ms1m_step%d.pth' % (self.args.model_type, 
+                                           self.args.step) 
         
-        if args.model_type == "adaface":
-            global_feats, _, norm = get_features_adaface(model, imgs)
-            y_pred_new = metric_fc(global_feats, norm, label)
-
-        elif args.model_type == "arcface":
-            global_feats = get_features_arcface(model, imgs)
-            y_pred_new = metric_fc(global_feats, label) 
-
+        state_path = os.path.join(save_dir, name)
+        state = {'model': self.model.state_dict(), 
+                 "metric_fc": self.metric_fc.state_dict()}
         
-        last_class = args.class_range
-        loss_CE = criterion(y_pred_new[:, :last_class], label)
-
-        loss = loss_CE
-        total_loss += loss_CE.item()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    print(f'\nTraining Epoch [{args.current_epoch}/{args.max_epoch}]', end="")
-    print(" | total loss {:0.7f}".format(total_loss / args.train_size))
+        torch.save(state, state_path)
+        print("saving ... ", name)
 
 
-def valid_epoch(ls_valid_dl, model, metric_fc, criterion,  args):
-    device = args.device
-    model.eval()
-    metric_fc.eval()
+    def get_dataloaders(self, ):
+        if self.args.train == True:
+            self.args.split = "train"
+            train_ds = TrainDataset(self.args) 
+            self.args.train_size = train_ds.__len__()
 
-    with torch.no_grad():
+            self.train_dl = torch.utils.data.DataLoader(
+                train_ds, 
+                batch_size=self.args.batch_size, 
+                drop_last=False,
+                num_workers=self.args.num_workers, 
+                shuffle=True)
+
+            self.args.ver_list = os.path.join("./data", self.args.test_dataset, 
+                                              "images", self.args.test_file)
+            self.args.split = "valid"
+            del train_ds
+
+        elif self.args.train == False:
+            self.args.ver_list = os.path.join("./data", self.args.test_dataset, 
+                                              "images", self.args.test_file)
+            self.args.split = "test"
+
+        valid_ds = TestDataset(self.args)
+        self.valid_dl = torch.utils.data.DataLoader(
+            valid_ds, 
+            batch_size=self.args.batch_size, 
+            drop_last=False,
+            num_workers=self.args.num_workers, 
+            shuffle=False)
+
+        del valid_ds
+
+
+    def get_optimizer(self, ):
+        ss = 25 if self.args.is_base == True else 3
+        lr_new = self.args.lr_train if self.args.is_base == True else 0.01
+
+        self.optimizer = torch.optim.SGD(self.model.parameters(), 
+                                        lr = lr_new, 
+                                        momentum= self.args.momentum, 
+                                        weight_decay= self.args.weight_decay)
+
+        self.optimizer_fc = torch.optim.SGD(self.metric_fc.parameters(), 
+                                        lr = lr_new, 
+                                        momentum= self.args.momentum, 
+                                        weight_decay= self.args.weight_decay)
+        
+        self.lrs_optimizer = torch.optim.lr_scheduler.StepLR(
+                                        self.optimizer, 
+                                        step_size = ss,
+                                        gamma=0.9997)
+        
+        self.lrs_optimizer_fc = torch.optim.lr_scheduler.StepLR(
+                                        self.optimizer_fc, 
+                                        step_size = ss,
+                                        gamma=0.9997)
+
+
+    def train_epoch(self, ):
+        print("\n")
+        self.metric_fc.train()
+        self.model.train()
         total_loss = 0
-        correct = 0
-        for imgs, label in ls_valid_dl:
+        loop = tqdm(total = len(self.train_dl))
 
-            # load cuda
-            imgs = imgs.to(device).requires_grad_()
-            label = label.to(device)
+        for i, (imgs, label) in enumerate(self.train_dl):
+            imgs = imgs.to(my_device) 
+            label = label.to(my_device)
             
-            if args.model_type == "adaface":
-                global_feats, _, norm = get_features_adaface(model, imgs)
-                output = metric_fc(global_feats, norm, label) 
+            if self.args.model_type == "adaface":
+                global_feats, _, norm = self.model(imgs)
+                y_pred_new = self.metric_fc(global_feats, norm, label)
 
-            elif args.model_type == "arcface":
-                global_feats = get_features_arcface(model, imgs)
-                output = metric_fc(global_feats, label) 
+            elif self.args.model_type == "arcface":
+                global_feats, local_3 = self.model(imgs)
+                global_feats_old, local_3_old = self.model_old(imgs)
+                y_pred_new = self.metric_fc(global_feats, label) 
             
-            last_class = args.class_range        
-            loss = criterion(output[:, :last_class], label)
-            total_loss += loss.item()
+            last_class = self.args.class_range
 
-            out_ind = torch.argmax(output, axis=1)
-            correct += sum(out_ind == label)
+            if self.args.is_base == True:
+                loss_CE = self.criterion(y_pred_new, label)
 
-        acc = correct / args.valid_size
-        val_loss = total_loss / args.valid_size
-        print("Base training: val acc {:0.8f}| loss {:0.8f}".format(acc, val_loss))
+            elif self.args.is_base == False:
+                last_class = self.args.step * self.args.class_range
+                loss_CE = self.criterion(y_pred_new[:, :last_class], label)
+                loss_gpkd = self.args.delta_gpkd * get_gpkd(global_feats, global_feats_old)
+
+            total_loss += loss_CE.item()
+            loss = loss_CE + loss_gpkd
+            self.optimizer.zero_grad()
+            self.optimizer_fc.zero_grad()
+            loss.backward()
+
+            self.optimizer_fc.step()
+            if (self.args.current_epoch >= self.args.freeze):
+                self.optimizer.step()
+                self.lrs_optimizer.step()
+                self.lrs_optimizer_fc.step()
+
+            # update loop information
+            loop.update(1)
+            loop.set_description(f'Training Epoch [{self.args.current_epoch + 1}/{self.args.max_epoch}]')
+            loop.set_postfix()
+
+        loop.close()
+        print("total loss {:0.7f}".format(total_loss / self.args.train_size))
+        print("lr model: ", self.lrs_optimizer.get_last_lr())
+        print("lr metric_fc: ", self.lrs_optimizer_fc.get_last_lr())
 
 
-def main(args):
-    # config for two mode (base and IL for full_fozen)
-    LR_change_seq = args.lr_base_training
+    def train(self,):
+        print("\nstart training ...")
+        self.model_old = copy.deepcopy(self.model)
+        for p in self.model_old.parameters():
+            p.requires_grad = False
+        self.model_old.eval()
 
-    #load model (cuda + parallel + grd. false + eval)
-    if args.model_type == "adaface":   model = prepare_adaface_base(args) 
-    elif args.model_type == "arcface": model = prepare_arcface_base(args)
+        for epoch in range(self.args.max_epoch):
+            self.args.current_epoch = epoch
+            self.train_epoch()
+            
+            if epoch > 4:
+                acc = valid_epoch(self.valid_dl, self.model, self.args)
 
-    metric_fc = get_margin(args)
-    
-    opt = get_optimizer(args, model, metric_fc)    
-    criterion = get_loss(args)
-    ls_valid_dl = get_all_valid_loaders()
+                if acc > self.val_acc:
+                    self.val_acc = acc
+                    self.save_model()
 
-    #pprint.pprint(args)
-    print("\nstart training ...")
-        
-    trans = get_dataset_specific_transform(args, train=True)
-    train_ds = FacescrubClsDataset(transform=trans, split="base", step=0, args=args)
-    args.train_size = train_ds.__len__()
+            if epoch == 11 and self.args.is_base == True:
+                self.lrs_optimizer.gamma = 0.9994
+                self.lrs_optimizer_fc.gamma = 0.9994
+                print("chaning gamma value of lr scheduler")
 
-    train_dl = torch.utils.data.DataLoader(
-        train_ds, 
-        batch_size=args.batch_size, 
-        drop_last=False,
-        num_workers=args.num_workers, 
-        shuffle=True)
+        print("Best val_acc: {:.5f}".format(self.val_acc))
 
-    del train_ds 
-    lr = args.lr_image_train
-    
-    for epoch in range(1, args.max_epoch + 1):
-        args.current_epoch = epoch
-    
-        train_epoch(train_dl, model, metric_fc, criterion, opt, args)
 
-        if epoch % args.save_interval==0:
-            save_base_model(model, epoch, args)
-
-        if ((args.do_valid == True) and (epoch % args.valid_interval == 0) and (epoch != 0)):
-            valid_epoch(ls_valid_dl, model, metric_fc, criterion, args)
-
-        if epoch in LR_change_seq:
-            lr = lr * args.gamma 
-            for g in opt.param_groups:
-                g['lr'] = lr 
-            print("Learning Rate change to: {:0.5f}".format(lr))
-        
-
-if __name__ == "__main__":
-    args = merge_args_yaml(parse_args())
-
-    # set seed
-    if args.manual_seed is None:
-        args.manual_seed = 100
-    random.seed(args.manual_seed)
-    np.random.seed(args.manual_seed)
-    torch.manual_seed(args.manual_seed)
-
-    torch.cuda.manual_seed_all(args.manual_seed)
-    args.device = torch.device("cuda")
-    
-    main(args)
+    def test(self, ):
+        print("\n **** start testing ****")
+        valid_epoch(self.valid_dl, self.model, self.args)

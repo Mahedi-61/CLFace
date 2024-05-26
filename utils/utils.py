@@ -6,20 +6,10 @@ import yaml
 from easydict import EasyDict as edict
 import datetime
 import dateutil.tz
-
-
-def params_count(model):
-    return np.sum([p.numel() for p in model.parameters()]).item()
-
-
-def mkdir_p(path):
-    try:
-        os.makedirs(path)
-    except OSError as exc:  # Python >2.5
-        if exc.errno == errno.EEXIST and os.path.isdir(path):
-            pass
-        else:
-            raise
+from PIL import Image 
+from albumentations.pytorch import ToTensorV2
+import albumentations as A 
+from torchvision import transforms
 
 # config
 def get_time_stamp():
@@ -43,11 +33,90 @@ def merge_args_yaml(args):
     return args
 
 
-def save_args(save_path, args):
-    fp = open(save_path, 'w')
-    fp.write(yaml.dump(args))
-    fp.close()
 
+def get_transform_img(img_path, split, model_type="arcface"):
+    img = np.array(Image.open(img_path).convert('RGB')) 
+
+    train_transforms = A.Compose([
+        A.HorizontalFlip(p = 0.5),
+        A.Normalize(mean=torch.tensor([0.5412688 , 0.43232402, 0.37956172]), 
+                    std=torch.tensor([0.28520286, 0.2531577 , 0.24701026]),
+                    always_apply=True),
+        ToTensorV2()
+    ])
+
+    valid_transforms = A.Compose([
+        A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], always_apply=True),
+        ToTensorV2()
+    ])
+
+    if split == "train": tfms = train_transforms
+    elif split == "test" or split == "valid":  tfms = valid_transforms
+
+    img = tfms(image=img)["image"] 
+    if model_type == "adaface": 
+        permute = [2, 1, 0]
+        img = img[permute, :, :] #RGB --> BGR
+
+    return img 
+
+
+def do_flip_test_images(img_path, model_type="arcface"):
+    img = np.array(Image.open(img_path).convert('RGB')) 
+    tfms = A.Compose([
+        A.HorizontalFlip(p = 1),
+        A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], always_apply=True),
+        ToTensorV2()
+    ])
+
+    img = tfms(image=img)["image"] 
+    if model_type == "adaface": 
+        permute = [2, 1, 0]
+        img = img[permute, :, :] #RGB --> BGR
+    return img
+
+
+def get_imgs_dir(data_dir, args):
+    img_dir = os.path.join(data_dir, "images")
+    sub_ls = sorted(os.listdir(img_dir), key= lambda x: int(x))
+    
+    if args.step == 0:
+        sub_ls = sub_ls[ : args.base_num]
+    else:
+        begin_index = args.base_num + (args.class_range * (args.step - 1))
+        end_index = begin_index + args.class_range
+        sub_ls = sub_ls[begin_index : end_index]
+
+    all_imgs = []
+    all_labels = []
+
+    print("base number: ", args.base_num)
+    print("class_range: ", args.class_range)
+    print("Step: %d | Subject list: %s, %s ..... %s, %s" % 
+          (args.step, sub_ls[0], sub_ls[1], sub_ls[-2], sub_ls[-1]))
+    
+    for sub in sub_ls:
+        sub_dir = os.path.join(img_dir, sub)
+        #sub_imgs = sorted(os.listdir(sub_dir), key= lambda x: int((x.split("_")[-1]).split(".")[0]))
+
+        sub_imgs_dir = [os.path.join(sub_dir, img) for img in os.listdir(sub_dir)]
+        all_imgs += sub_imgs_dir
+
+        if args.step == 0:
+            all_labels += [int(sub)] * len(sub_imgs_dir) 
+        else:
+            all_labels += [int(sub) - args.base_num] * len(sub_imgs_dir) 
+
+    if args.step == 0:
+        print("Labels: %d, %d ..... %d, %d" % 
+          (int(sub_ls[0]), int(sub_ls[1]), int(sub_ls[-2]), int(sub_ls[-1])))
+    else:
+        print("Labels: %d, %d ..... %d, %d" % 
+          (int(sub_ls[0]) - args.base_num, int(sub_ls[1]) - args.base_num, 
+           int(sub_ls[-2]) - args.base_num, int(sub_ls[-1]) - args.base_num))
+    
+    print("Total images: ", len(all_imgs))
+    return all_imgs, all_labels
 
 
 def load_model_weights(model, weights, multi_gpus = False):
@@ -70,69 +139,29 @@ def load_model_weights(model, weights, multi_gpus = False):
     return model
 
 
+def load_base_model(model, metric_fc, path):
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['base_model'])
+    metric_fc.load_state_dict(checkpoint['metric_Fc'])
+    return model, metric_fc
 
 
-def save_base_model(model, epoch, args):
-    save_dir = os.path.join(args.checkpoints_path, 
-                            args.dataset_name, 
-                            args.CONFIG_NAME,  
-                            args.model_type)
-    mkdir_p(save_dir)
-
-    name = '%s_base_epoch_%d.pth' % (args.model_type, epoch)
-    state_path = os.path.join(save_dir, name)
-    state = {'base_model': model.state_dict()}
-    torch.save(state, state_path)
-    print("saving ... ", name)
-
-
-def save_model(metric_fc, epoch, args):
-    save_dir = os.path.join(args.checkpoints_path, 
-                            args.dataset_name, 
-                            args.CONFIG_NAME,  
-                            args.model_type)
-    mkdir_p(save_dir)
-
-    name = '%s_full_frozen_epoch_%d.pth' % (args.model_type, epoch)
-    state_path = os.path.join(save_dir, name)
-    state = {'model': {'metric_fc': metric_fc.state_dict()}}
-    torch.save(state, state_path)
-
-
-def save_shared_models(shared_net, metric_fc, epoch, args):
-    save_model_dir = os.path.join(args.checkpoints_path, 
-                                  args.dataset_name, 
-                                  args.CONFIG_NAME,  
-                                  args.model_type)
-    
-    
-    mkdir_p(save_model_dir)
-
-    model_name = '%s_shared_epoch_%d.pth' % (args.model_type, epoch)
-    state_model_path = os.path.join(save_model_dir, model_name)
-
-    state_model = {"model": {'shared_net': shared_net.state_dict(), 
-                             'metric_fc': metric_fc.state_dict()}}
-
-    torch.save(state_model, state_model_path)
-
-
-
-
-def load_base_model(model, path):
+def load_full_model(model, path):
     checkpoint = torch.load(path, map_location=torch.device('cpu'))
-    model = load_model_weights(model, checkpoint['base_model'])
-    return model 
-
-
-def load_full_frozen_model(metric_fc, path):
-    print("loading full frozen model .....")
-    checkpoint = torch.load(path, map_location=torch.device('cpu'))
-    metric_fc = load_model_weights(metric_fc, checkpoint['model']['metric_fc'])
-    return metric_fc  
+    model = load_model_weights(model, checkpoint['model']['model'])
+    return model  
 
 
 def load_shared_model(shared_net, model_path):
     model_checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
     shared_net = load_model_weights(shared_net, model_checkpoint['model']['shared_net'])
     return shared_net 
+
+
+if __name__ == "__main__":
+    from easydict import EasyDict
+    args = EasyDict()
+    args.step = 5
+    args.class_range= 8574
+    data_dir = "./data/ms1m"
+    get_imgs_dir(data_dir, args)

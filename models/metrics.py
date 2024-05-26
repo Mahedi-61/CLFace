@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn import Parameter
 import math
 
+my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class ArcMarginProduct(nn.Module):
     r"""Implement of large margin arc distance: :
@@ -17,20 +18,20 @@ class ArcMarginProduct(nn.Module):
 
             cos(theta + m)
         """
-    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+    def __init__(self, in_features, out_features, s=64.0, margin=0.5):
         super(ArcMarginProduct, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.easy_margin = False
         self.s = s
-        self.m = m
+        self.margin = margin
         self.weight = Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
 
-        self.easy_margin = easy_margin
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
+        self.cos_m = math.cos(margin)
+        self.sin_m = math.sin(margin)
+        self.theta = math.cos(math.pi - margin)
+        self.mm = math.sin(math.pi - margin) * margin
 
     def forward(self, input, label):
         # --------------------------- cos(theta) & phi(theta) ---------------------------
@@ -40,10 +41,11 @@ class ArcMarginProduct(nn.Module):
         if self.easy_margin:
             phi = torch.where(cosine > 0, phi, cosine)
         else:
-            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+            phi = torch.where(cosine > self.theta, phi, cosine - self.mm)
+
         # --------------------------- convert label to one-hot ---------------------------
-        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device='cuda')
-        one_hot = torch.zeros(cosine.size(), device='cuda')
+        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device=my_device)
+        one_hot = torch.zeros(cosine.size(), device=my_device)
         one_hot.scatter_(1, label.view(-1, 1).long(), 1)
         # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)  # you can use torch.where if your torch.__version__ is 0.4
@@ -52,6 +54,31 @@ class ArcMarginProduct(nn.Module):
 
         return output
 
+
+class ArcFace(torch.nn.Module):
+    def __init__(self, s=64.0, margin=0.5):
+        super(ArcFace, self).__init__()
+        self.s = s
+        self.margin = margin
+        self.cos_m = math.cos(margin)
+        self.sin_m = math.sin(margin)
+        self.theta = math.cos(math.pi - margin)
+        self.sinmm = math.sin(math.pi - margin) * margin
+        self.easy_margin = False
+
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor):
+        index = torch.where(labels != -1)[0]
+        target_logit = logits[index, labels[index].view(-1)]
+
+        with torch.no_grad():
+            target_logit.arccos_()
+            logits.arccos_()
+            final_target_logit = target_logit + self.margin
+            logits[index, labels[index].view(-1)] = final_target_logit
+            logits.cos_()
+        logits = logits * self.s   
+        return logits
 
 class AddMarginProduct(nn.Module):
     r"""Implement of large margin cosine distance: :
@@ -77,7 +104,7 @@ class AddMarginProduct(nn.Module):
         cosine = F.linear(F.normalize(input), F.normalize(self.weight))
         phi = cosine - self.m
         # --------------------------- convert label to one-hot ---------------------------
-        one_hot = torch.zeros(cosine.size(), device='cuda')
+        one_hot = torch.zeros(cosine.size(), device=my_device)
         # one_hot = one_hot.cuda() if cosine.is_cuda else one_hot
         one_hot.scatter_(1, label.view(-1, 1).long(), 1)
         # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------

@@ -1,6 +1,6 @@
-CONFIG_NAME: base  #base, full_frozen, shared, test
-dataset_name: lfw #facescrub, cifar100
-class_range: 2870 #(276, 25), 
+CONFIG_NAME: JT  #base, JT, shared, test
+dataset_name: facescrub
+class_range: 250 #(276, 25), 
 total_step: 1 #10
 
 # machine setup 
@@ -11,21 +11,27 @@ manual_seed: 100
 # model arch
 img_size: 112
 model_type: arcface
-num_classes: 2870 #(276, 250)
+num_classes: 250 #(276, 250)
 final_dim: 512 
 metric: arc_margin 
 easy_margin: False
 loss: focal_loss 
 optimizer: sgd 
 use_se: False
+s: 6
+m: 0.0
 
-
+# training setup
+lr_base_training: [5, 8, 11]
+lr_shared_training: [2, 8, 11]
 lr_shared_layer: 0.0001 #1e-4
 temperature: 2
+max_epoch: 14
+batch_size: 128  
+valid_interval: 1
+save_interval: 2
 
-
-
-# training settings 
+# objective function
 lr_image_train: 0.1   #0.1 for ArcFace
 gamma: 0.1  #0.5
 weight_decay: 0.0005 #0.0005 for base, 0.0001 for IL
@@ -34,14 +40,9 @@ KD: 8
 kl_div: 400
 att_distill: 2 
 
-max_epoch: 15
-batch_size: 128  
-valid_interval: 1
-save_interval: 2
-
 # test settings
 is_unseen: True
-num_imposter_per_sub: 10 
+num_imposter_per_sub: 25 
 seen_steps: 4
 
 #save
@@ -67,4 +68,5 @@ is_base: False
 arcface_base_path: ./weights/facescrub/base/arcface_ir18.pth
 adaface_base_path: ./weights/facescrub/base/adaface_ir18.pth
 
-arcface_test_path: ./checkpoints/facescrub/shared/arcface/arcface_ir18.pth
+arcface_test_path: ./checkpoints/facescrub/JT/argcface/best_s_6.pth #shared/arcface/arcface_ir18.pth
+arcface_full_model_path: ./checkpoints/facescrub/JT/arcface/best.pth 
