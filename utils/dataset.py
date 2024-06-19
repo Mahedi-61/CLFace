@@ -16,14 +16,25 @@ class TrainDataset():
         print("\nLoading %s dataset: " % args.split)
         self.data_dir = os.path.join("./data", args.dataset)
         self.model_type = args.model_type
-        self.filenames, self.class_id = get_imgs_dir(self.data_dir, args)
+        self.filenames, self.sub_imgs, self.class_id = get_imgs_dir(self.data_dir, args)
+        self.args = args
 
     def __len__(self):
         return len(self.filenames)
 
     def __getitem__(self, index):
-        img_name = self.filenames[index]
-        cls_id = self.class_id[index]
+        if not self.args.is_base: 
+            idx = index % self.args.class_range
+            img_list = self.sub_imgs[idx]
+            cls_list = self.class_id[idx]
+            rand_id = random.choice(range(0, len(img_list)))
+
+            img_name = img_list[rand_id]
+            cls_id = cls_list[rand_id]   
+
+        elif self.args.is_base:
+            self.filenames[index]
+            self.class_id[index]
 
         imgs = get_transform_img(img_name, "train", self.model_type)
         return imgs, torch.tensor(cls_id) 

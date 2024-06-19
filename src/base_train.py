@@ -12,12 +12,15 @@ from utils.dataset import TrainDataset, TestDataset
 from models import focal_loss
 from utils.modules import * 
 
-my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class BaseTrainer:
     def __init__(self, args):
         self.args = args
+        self.my_device = torch.device('cuda:%d' % self.args.gpu_id 
+                                      if torch.cuda.is_available() else 'cpu')
+
+        self.args.my_device = self.my_device 
         num = args.num_classes // 2 
         self.base_num = num - (num % args.step_size)
         self.class_range = self.base_num // args.step_size 
@@ -30,6 +33,7 @@ class BaseTrainer:
         if self.args.is_base: 
             self.args.step = 0
             self.args.freeze = 0
+            self.args.max_epoch = 20
 
         self.get_dataloaders()
 
@@ -43,26 +47,6 @@ class BaseTrainer:
 
         self.metric_fc = prepare_margin(self.args)
         self.get_optimizer()    
-
-
-    def save_model(self, ):
-        save_dir = os.path.join(self.args.checkpoint_path, 
-                                self.args.dataset, 
-                                self.args.setup,
-                                str(self.args.step_size),
-                                "step%d" % self.args.step)
-        
-        os.makedirs(save_dir, exist_ok=True)
-
-        name = '%s_18_ms1m_step%d.pth' % (self.args.model_type, 
-                                           self.args.step) 
-        
-        state_path = os.path.join(save_dir, name)
-        state = {'model': self.model.state_dict(), 
-                 "metric_fc": self.metric_fc.state_dict()}
-        
-        torch.save(state, state_path)
-        print("saving ... ", name)
 
 
     def get_dataloaders(self, ):
@@ -132,16 +116,15 @@ class BaseTrainer:
         loop = tqdm(total = len(self.train_dl))
 
         for i, (imgs, label) in enumerate(self.train_dl):
-            imgs = imgs.to(my_device) 
-            label = label.to(my_device)
+            imgs = imgs.to(self.my_device) 
+            label = label.to(self.my_device)
             
             if self.args.model_type == "adaface":
                 global_feats, _, norm = self.model(imgs)
                 y_pred_new = self.metric_fc(global_feats, norm, label)
 
             elif self.args.model_type == "arcface":
-                global_feats, local_3 = self.model(imgs)
-                global_feats_old, local_3_old = self.model_old(imgs)
+                global_feats, l_2, l_3, l_4 = self.model(imgs)
                 y_pred_new = self.metric_fc(global_feats, label) 
             
             last_class = self.args.class_range
@@ -152,13 +135,11 @@ class BaseTrainer:
             elif self.args.is_base == False:
                 last_class = self.args.step * self.args.class_range
                 loss_CE = self.criterion(y_pred_new[:, :last_class], label)
-                loss_gpkd = self.args.delta_gpkd * get_gpkd(global_feats, global_feats_old)
 
-            total_loss += loss_CE.item()
-            loss = loss_CE + loss_gpkd
             self.optimizer.zero_grad()
             self.optimizer_fc.zero_grad()
-            loss.backward()
+            loss_CE.backward()
+            total_loss += loss_CE.item()
 
             self.optimizer_fc.step()
             if (self.args.current_epoch >= self.args.freeze):
@@ -179,30 +160,25 @@ class BaseTrainer:
 
     def train(self,):
         print("\nstart training ...")
-        self.model_old = copy.deepcopy(self.model)
-        for p in self.model_old.parameters():
-            p.requires_grad = False
-        self.model_old.eval()
-
         for epoch in range(self.args.max_epoch):
             self.args.current_epoch = epoch
             self.train_epoch()
             
-            if epoch > 4:
+            if epoch > 3:
                 acc = valid_epoch(self.valid_dl, self.model, self.args)
 
                 if acc > self.val_acc:
                     self.val_acc = acc
-                    self.save_model()
+                    save_model(self.args, self.model, self.metric_fc)
 
-            if epoch == 11 and self.args.is_base == True:
+            if epoch == 10 and self.args.is_base == True:
                 self.lrs_optimizer.gamma = 0.9994
                 self.lrs_optimizer_fc.gamma = 0.9994
                 print("chaning gamma value of lr scheduler")
 
-        print("Best val_acc: {:.5f}".format(self.val_acc))
+        return self.val_acc
 
 
     def test(self, ):
         print("\n **** start testing ****")
-        valid_epoch(self.valid_dl, self.model, self.args)
+        return valid_epoch(self.valid_dl, self.model, self.args)

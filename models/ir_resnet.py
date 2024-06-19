@@ -154,9 +154,11 @@ class IResNet(nn.Module):
             x = self.prelu(x)
             x = self.layer1(x)
             x = self.layer2(x)
+            l_2 = x
             x = self.layer3(x)
-            local_3 = x
+            l_3 = x
             x = self.layer4(x)
+            l_4 = x
             x = self.bn2(x)
             x.requires_grad_(True)
             x = torch.flatten(x, 1)
@@ -164,7 +166,7 @@ class IResNet(nn.Module):
 
         x = self.fc(x.float() if self.fp16 else x)
         x = self.features(x)
-        return x, local_3 
+        return x, l_2, l_3, l_4  
 
 
 def _iresnet(arch, block, layers, pretrained, progress, **kwargs):

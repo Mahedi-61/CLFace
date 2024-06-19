@@ -9,7 +9,6 @@ import dateutil.tz
 from PIL import Image 
 from albumentations.pytorch import ToTensorV2
 import albumentations as A 
-from torchvision import transforms
 
 # config
 def get_time_stamp():
@@ -31,7 +30,6 @@ def merge_args_yaml(args):
         args.update(opt)
         args = edict(args)
     return args
-
 
 
 def get_transform_img(img_path, split, model_type="arcface"):
@@ -89,6 +87,7 @@ def get_imgs_dir(data_dir, args):
 
     all_imgs = []
     all_labels = []
+    all_files = []
 
     print("base number: ", args.base_num)
     print("class_range: ", args.class_range)
@@ -100,12 +99,13 @@ def get_imgs_dir(data_dir, args):
         #sub_imgs = sorted(os.listdir(sub_dir), key= lambda x: int((x.split("_")[-1]).split(".")[0]))
 
         sub_imgs_dir = [os.path.join(sub_dir, img) for img in os.listdir(sub_dir)]
-        all_imgs += sub_imgs_dir
+        all_imgs += [sub_imgs_dir]
+        all_files += sub_imgs_dir 
 
         if args.step == 0:
             all_labels += [int(sub)] * len(sub_imgs_dir) 
         else:
-            all_labels += [int(sub) - args.base_num] * len(sub_imgs_dir) 
+            all_labels += [[int(sub) - args.base_num] * len(sub_imgs_dir)] 
 
     if args.step == 0:
         print("Labels: %d, %d ..... %d, %d" % 
@@ -116,7 +116,7 @@ def get_imgs_dir(data_dir, args):
            int(sub_ls[-2]) - args.base_num, int(sub_ls[-1]) - args.base_num))
     
     print("Total images: ", len(all_imgs))
-    return all_imgs, all_labels
+    return all_files, all_imgs, all_labels
 
 
 def load_model_weights(model, weights, multi_gpus = False):

@@ -12,12 +12,13 @@ from utils.dataset import TrainDataset, TestDataset
 from models import focal_loss
 from utils.modules import * 
 
-my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
 class CLFace:
     def __init__(self, args):
         self.args = args
+        self.my_device = torch.device('cuda:%d' % self.args.gpu_id 
+                                    if torch.cuda.is_available() else 'cpu')
+
+        self.args.my_device = self.my_device 
         num = args.num_classes // 2 
         self.base_num = num - (num % args.step_size)
         self.class_range = self.base_num // args.step_size 
@@ -45,26 +46,6 @@ class CLFace:
         self.get_optimizer()    
 
 
-    def save_model(self, ):
-        save_dir = os.path.join(self.args.checkpoint_path, 
-                                self.args.dataset, 
-                                self.args.setup,
-                                str(self.args.step_size),
-                                "step%d" % self.args.step)
-        
-        os.makedirs(save_dir, exist_ok=True)
-
-        name = '%s_18_ms1m_step%d.pth' % (self.args.model_type, 
-                                           self.args.step) 
-        
-        state_path = os.path.join(save_dir, name)
-        state = {'model': self.model.state_dict(), 
-                 "metric_fc": self.metric_fc.state_dict()}
-        
-        torch.save(state, state_path)
-        print("saving ... ", name)
-
-
     def get_dataloaders(self, ):
         if self.args.train == True:
             self.args.split = "train"
@@ -76,7 +57,7 @@ class CLFace:
                 batch_size=self.args.batch_size, 
                 drop_last=False,
                 num_workers=self.args.num_workers, 
-                shuffle=True)
+                shuffle=False) ############################################## True 
 
             self.args.ver_list = os.path.join("./data", self.args.test_dataset, 
                                               "images", self.args.test_file)
@@ -101,7 +82,7 @@ class CLFace:
 
     def get_optimizer(self, ):
         ss = 25 if self.args.is_base == True else 3
-        lr_new = self.args.lr_train if self.args.is_base == True else 0.01
+        lr_new = self.args.lr_train if self.args.is_base == True else 0.0078
 
         self.optimizer = torch.optim.SGD(self.model.parameters(), 
                                         lr = lr_new, 
@@ -129,50 +110,56 @@ class CLFace:
         self.metric_fc.train()
         self.model.train()
         
-        print_loss = {}
-        print_loss["ce_loss"] = 0
-        print_loss["gpkd_loss"] = 0
-        print_loss["pod_loss"] = 0
+        loss_meter = {}
+        loss_meter["id_loss"] = 0
+        loss_meter["gpkd_loss"] = 0
+        loss_meter["msd_loss"] = 0
+        loss_meter["ckd_loss"] = 0
         loop = tqdm(total = len(self.train_dl))
 
         for i, (imgs, label) in enumerate(self.train_dl):
-            imgs = imgs.to(my_device) 
-            label = label.to(my_device)
+            imgs = imgs.to(self.my_device) 
+            label = label.to(self.my_device)
             
             if self.args.model_type == "adaface":
                 global_feats, _, norm = self.model(imgs)
                 y_pred_new = self.metric_fc(global_feats, norm, label)
 
             elif self.args.model_type == "arcface":
-                global_feats, local_3 = self.model(imgs)
-                global_feats_old, local_3_old = self.model_old(imgs)
-                y_pred_new = self.metric_fc(global_feats, label) 
+                global_feats, l_2, l_3, l_4 = self.model(imgs)
+                global_feats_old, l_2_old, l_3_old, l_4_old = self.model_old(imgs)
+                if self.args.add_id_loss: y_pred_new = self.metric_fc(global_feats, label) 
             
-            last_class = self.args.class_range
-
             if self.args.is_base == True:
-                loss_CE = self.criterion(y_pred_new, label)
+                loss_ID = self.criterion(y_pred_new, label)
 
             elif self.args.is_base == False:
+                ls_old = [l_2_old, l_3_old, l_4_old]
+                ls_new = [l_2, l_3, l_4]
+
                 last_class = self.args.step * self.args.class_range
-                loss_CE = self.criterion(y_pred_new[:, :last_class], label)
-                loss_gpkd = self.args.delta_gpkd * get_gpkd(global_feats, global_feats_old)
-                loss_pod = 0.0  #self.args.delta_pod * pod_loss(local_3_old, local_3)
-                
-                loss = loss_CE + loss_gpkd + loss_pod
-                print_loss["ce_loss"] += loss_CE.item()
-                print_loss["gpkd_loss"] +=  0.0 #loss_gpkd.item() 
-                print_loss["pod_loss"] +=  0.0 #loss_pod.item()
+                if self.args.add_id_loss: loss_ID =  self.criterion(y_pred_new[:, :last_class], label)
+                else: loss_ID = 0.0
+
+                loss_gpkd = self.args.delta_gpkd * get_gpkd(global_feats, global_feats_old, self.args)
+                msd_loss = self.args.delta_msd *   get_msd_loss(ls_old, ls_new, self.args)
+                loss_ckd = self.args.delta_ckd *   get_ckd_loss(global_feats, global_feats_old)
+
+                loss = loss_ID + loss_ckd + loss_gpkd + msd_loss 
+                if self.args.add_id_loss: loss_meter["id_loss"] += loss_ID.item()
+                loss_meter["gpkd_loss"] +=  loss_gpkd.item() 
+                loss_meter["msd_loss"]  +=  msd_loss.item()
+                loss_meter["ckd_loss"]  +=  loss_ckd.item()
 
             self.optimizer.zero_grad()
-            self.optimizer_fc.zero_grad()
+            if self.args.add_id_loss:  self.optimizer_fc.zero_grad()
             loss.backward()
 
-            self.optimizer_fc.step()
+            if self.args.add_id_loss:  self.optimizer_fc.step()
             if (self.args.current_epoch >= self.args.freeze):
                 self.optimizer.step()
                 self.lrs_optimizer.step()
-                self.lrs_optimizer_fc.step()
+                if self.args.add_id_loss: self.lrs_optimizer_fc.step()
 
             # update loop information
             loop.update(1)
@@ -180,24 +167,16 @@ class CLFace:
             loop.set_postfix()
 
         loop.close()
-        print("Focal Loss {:0.7f}".format(print_loss["ce_loss"] / self.args.train_size))
-        print("GPKD  Loss {:0.7f}".format(print_loss["gpkd_loss"]  / self.args.train_size))
-        print("POD  Loss {:0.7f}".format(print_loss["pod_loss"]  / self.args.train_size))
 
-        print("lr model: ", self.lrs_optimizer.get_lr())
-        print("lr metric_fc: ", self.lrs_optimizer_fc.get_lr())
+        print("GPKD  Loss {:0.7f}".format(loss_meter["gpkd_loss"]  / self.args.train_size))
+        print("MSD  Loss {:0.7f}".format(loss_meter["msd_loss"]  / self.args.train_size))
+        print("CKD  Loss {:0.7f}".format(loss_meter["ckd_loss"]  / self.args.train_size))
+        print("lr model: ", self.lrs_optimizer.get_last_lr())
 
+        if self.args.add_id_loss:
+            print("\nlr metric_fc: ", self.lrs_optimizer_fc.get_last_lr())
+            print("ID Loss {:0.7f}".format(loss_meter["id_loss"] / self.args.train_size))
 
-    """
-    if step == 0: 
-        # At first Inc. step only CE loss
-        loss = loss_CE
-        ce_loss += loss_CE.item()
-        total_loss += loss_CE.item()
-    else:
-        loss_KD = F.binary_cross_entropy_with_logits(y_pred_new[:, :last_class-args.class_range], 
-                                y_pred_old[:, :last_class-args.class_range].detach().sigmoid()) 
-    """
     
     def train(self,):
         print("\nstart training ...")
@@ -210,21 +189,21 @@ class CLFace:
             self.args.current_epoch = epoch
             self.train_epoch()
             
-            if epoch > 4:
+            if epoch > 1:
                 acc = valid_epoch(self.valid_dl, self.model, self.args)
 
                 if acc > self.val_acc:
                     self.val_acc = acc
-                    self.save_model()
+                    save_model(self.args, self.model, self.metric_fc)
 
             if epoch == 11 and self.args.is_base == True:
                 self.lrs_optimizer.gamma = 0.9994
                 self.lrs_optimizer_fc.gamma = 0.9994
                 print("chaning gamma value of lr scheduler")
 
-        print("Best val_acc: {:.5f}".format(self.val_acc))
+        return self.val_acc
 
 
     def test(self, ):
         print("\n **** start testing ****")
-        valid_epoch(self.valid_dl, self.model, self.args)
+        return valid_epoch(self.valid_dl, self.model, self.args)

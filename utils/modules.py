@@ -7,35 +7,43 @@ import torch.nn as nn
 import torch.nn.functional as F 
 import os, random  
 from tqdm import tqdm 
+from torch.autograd import Variable 
 
 ROOT_PATH = osp.abspath(osp.join(osp.dirname(osp.abspath(__file__)),  ".."))
 sys.path.insert(0, ROOT_PATH)
 
-from utils.utils import load_base_model, load_shared_model, load_full_model
+from utils.utils import load_base_model, load_full_model
 from models import net
-from models.ir_resnet import iresnet18
+from models.ir_resnet import iresnet18, iresnet50
 from models.metrics import ArcMarginProduct
 from models.models import AdaFace
-my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-class RandomApply(nn.Module):
-    def __init__(self, fn, p):
-        super().__init__()
-        self.fn = fn
-        self.p = p
+def save_model(args, model, metric_fc):
+    save_dir = os.path.join(args.checkpoint_path, 
+                            args.dataset, 
+                            args.setup,
+                            str(args.step_size),
+                            "step%d" % args.step)
+    
+    os.makedirs(save_dir, exist_ok=True)
 
-    def forward(self, x):
-        return x if random.random() > self.p else self.fn(x)
+    name = 'l_%s_%s_ms1m_step%d.pth' % (args.model_type, args.arch, args.step) 
+    
+    state_path = os.path.join(save_dir, name)
+    state = {'model': model.state_dict(), 
+             "metric_fc": metric_fc.state_dict()}
+    
+    torch.save(state, state_path)
+    print("saving ... ", name)
 
 
 
-def pod_loss(
+def get_msd_loss(
     list_attentions_a,
     list_attentions_b,
-    collapse_channels="spatial",
-    normalize=True,
-    **kwargs):
+    args):
+
     """Pooled Output Distillation.
     Reference:
         * Douillard et al.
@@ -47,62 +55,41 @@ def pod_loss(
     :param collapse_channels: How to pool the channels.
     :return: A float scalar loss.
     """
+    normalize=True
+    collapse_channels="channels"
+    
     assert len(list_attentions_a) == len(list_attentions_b)
+    loss = torch.tensor(0.).to(args.my_device)
 
-    loss = torch.tensor(0.).to(my_device)
-    #for i, (a, b) in enumerate(zip(list_attentions_a, list_attentions_b)):
-        # shape of (b, n, w, h)
-    a = list_attentions_a
-    b = list_attentions_b
+    for a, b in zip(list_attentions_a, list_attentions_b):
+        assert a.shape == b.shape, (a.shape, b.shape)
 
-    assert a.shape == b.shape, (a.shape, b.shape)
+        #a = torch.pow(a, 2)
+        #b = torch.pow(b, 2)
 
-    a = torch.pow(a, 2)
-    b = torch.pow(b, 2)
+        if collapse_channels == "channels":
+            a = a.sum(dim=1).view(a.shape[0], -1)  # shape of (b, w * h)
+            b = b.sum(dim=1).view(b.shape[0], -1)
+        else:
+            raise ValueError("Unknown method to collapse: {}".format(collapse_channels))
 
-    if collapse_channels == "channels":
-        a = a.sum(dim=1).view(a.shape[0], -1)  # shape of (b, w * h)
-        b = b.sum(dim=1).view(b.shape[0], -1)
+        if normalize:
+            a = F.normalize(a, dim=1, p=2)
+            b = F.normalize(b, dim=1, p=2)
 
-    elif collapse_channels == "width":
-        a = a.sum(dim=2).view(a.shape[0], -1)  # shape of (b, c * h)
-        b = b.sum(dim=2).view(b.shape[0], -1)
-
-    elif collapse_channels == "height":
-        a = a.sum(dim=3).view(a.shape[0], -1)  # shape of (b, c * w)
-        b = b.sum(dim=3).view(b.shape[0], -1)
-
-    elif collapse_channels == "gap":
-        a = F.adaptive_avg_pool2d(a, (1, 1))[..., 0, 0]
-        b = F.adaptive_avg_pool2d(b, (1, 1))[..., 0, 0]
-
-    elif collapse_channels == "spatial":
-        a_h = a.sum(dim=3).view(a.shape[0], -1)
-        b_h = b.sum(dim=3).view(b.shape[0], -1)
-        a_w = a.sum(dim=2).view(a.shape[0], -1)
-        b_w = b.sum(dim=2).view(b.shape[0], -1)
-        a = torch.cat([a_h, a_w], dim=-1)
-        b = torch.cat([b_h, b_w], dim=-1)
-    else:
-        raise ValueError("Unknown method to collapse: {}".format(collapse_channels))
-
-    if normalize:
-        a = F.normalize(a, dim=1, p=2)
-        b = F.normalize(b, dim=1, p=2)
-
-    layer_loss = torch.mean(torch.frobenius_norm(a - b, dim=-1))
-    loss = layer_loss #+
+        layer_loss = torch.mean(torch.frobenius_norm(a - b, dim=-1))
+        loss += layer_loss 
 
     return loss / len(list_attentions_a)
 
 
-def get_gpkd(global_feats, global_feats_old):
+def get_gpkd(global_feats, global_feats_old, args):
     global_feats = F.normalize(global_feats, p=2, dim=0)
     global_feats_old = F.normalize(global_feats_old, p=2, dim=0)
 
     return nn.CosineEmbeddingLoss()(global_feats, 
                                     global_feats_old.detach(), 
-                                    torch.ones(global_feats.shape[0]).to(my_device)) 
+                                    torch.ones(global_feats.shape[0]).to(args.my_device)) 
 
     
 
@@ -137,20 +124,20 @@ def valid_epoch(valid_dl, model, args):
         for  data in valid_dl:
             img1, img2, img1_h, img2_h, pair_label = data 
             
-            img1 = img1.to(my_device)
-            img2 = img2.to(my_device)
+            img1 = img1.to(args.my_device)
+            img2 = img2.to(args.my_device)
 
-            img1_h = img1_h.to(my_device)
-            img2_h = img2_h.to(my_device)
-            pair_label = pair_label.to(my_device)
+            img1_h = img1_h.to(args.my_device)
+            img2_h = img2_h.to(args.my_device)
+            pair_label = pair_label.to(args.my_device)
 
             # get global and local image features from COTS model
             if args.model_type == "arcface":
-                global_feat1, local_3 = model(img1)
-                global_feat2, local_3 = model(img2)
+                global_feat1, l_2, l_3, l_4 = model(img1)
+                global_feat2, l_2, l_3, l_4 = model(img2)
 
-                global_feat1_h, local_3  = model(img1_h)
-                global_feat2_h, local_3  = model(img2_h)
+                global_feat1_h, l_2, l_3, l_4  = model(img1_h)
+                global_feat2_h, l_2, l_3, l_4  = model(img2_h)
 
             elif args.model_type == "adaface":
                 global_feat1,  _, norm = model(img1)
@@ -219,8 +206,13 @@ def calculate_identification_acc(preds, labels, args):
 
 ###########   model   ############
 def prepare_arcface(args, ):
-    model = iresnet18(pretrained=False, progress=True)
-    model.to(my_device)
+    if args.arch == "18":
+        model = iresnet18(pretrained=False, progress=True)
+
+    elif args.arch == "50":
+        model = iresnet50(pretrained=False, progress=True)
+
+    model.to(args.my_device)
 
     if args.is_base == True:
         print("Backbone network (fully trainable + No pretrain weights)")
@@ -237,6 +229,7 @@ def prepare_margin(args, ):
     if args.model_type == "arcface":
         metric_fc = ArcMarginProduct(args.final_dim, 
                                         args.base_num, 
+                                        args.my_device,
                                         s= args.s, 
                                         margin= args.m)
 
@@ -244,7 +237,7 @@ def prepare_margin(args, ):
         metric_fc = AdaFace(embedding_size = args.final_dim, 
                             classnum = args.base_num) 
 
-    metric_fc.to(my_device)
+    metric_fc.to(args.my_device)
 
     if args.is_base == True:
         print("ArcFace network (fully trainable + No pretrain weights)")
@@ -257,11 +250,10 @@ def prepare_margin(args, ):
     return metric_fc
 
 
-
-def prepare_adaface(args):
+def prepare_adaface():
     architecture = "ir_18"
     model = net.build_model(architecture)
-    model.to(my_device)
+    #model.to(my_device)
     print("AdaFace network (fully trainable + No pretrain weights)")
     return model
 
@@ -281,45 +273,8 @@ def prepare_adaface_pretrained(args):
         model = load_full_model(model, model_path)
         print("Loading full model weights from: ", args.arcface_full_model_path)
 
-    model.to(my_device)
+    #model.to(my_device)
     return model 
-
-
-
-
-def prepare_arcface_shared(args):
-    model = iresnet18(pretrained=False, progress=True)
-
-    model_path = args.arcface_base_path
-    model = load_base_model(model, model_path)
-    print("Loading base weights")
-
-    base_net = nn.Sequential(*list(model.children())[:6])
-
-    start_layer = 9
-    if args.dataset_name == "cifar100": start_layer = 10
-    shared_net = nn.Sequential(*[*list(model.children())[6:9], 
-                 nn.Flatten(), *list(model.children())[start_layer:]])
-
-    base_net.to(my_device)
-    for p in base_net.parameters():
-        p.requires_grad = False
-
-
-    if args.CONFIG_NAME == "test":
-        model_path = args.arcface_test_path
-        shared_net = load_shared_model(shared_net, model_path)
-        for p in shared_net.parameters():
-            p.requires_grad = False
-        print("loading .. shared network for test: ", args.arcface_test_path) 
-
-
-    elif args.CONFIG_NAME == "shared":
-        for p in shared_net.parameters():
-            p.requires_grad = True
-    
-    shared_net.to(my_device)
-    return base_net, shared_net 
 
 
 
@@ -346,31 +301,6 @@ def kl_div(n_img, out, prev_out, T=2):
     return res
 
 
-def grad_cam_loss(feature_o, out_o, feature_n, out_n):
-    batch = out_n.size()[0]
-    index = out_n.argmax(dim=-1).view(-1, 1)
-    onehot = torch.zeros_like(out_n)
-    onehot.scatter_(-1, index, 1.)
-    out_o, out_n = torch.sum(onehot * out_o), torch.sum(onehot * out_n)
-    
-    grads_o = torch.autograd.grad(out_o, feature_o, allow_unused=True)[0]
-    print(grads_o)
-    print(grads_o.shape)
-    grads_n = torch.autograd.grad(out_n, feature_n, create_graph=True, allow_unused=True)[0]
-    weight_o = grads_o.mean(dim=(2, 3)).view(batch, -1, 1, 1)
-    weight_n = grads_n.mean(dim=(2, 3)).view(batch, -1, 1, 1)
-    
-    cam_o = F.relu((feature_o * weight_o).sum(dim=1)) #grads_o
-    cam_n = F.relu((feature_n * weight_n).sum(dim=1)) #grads_n
-    
-    # normalization
-    cam_o = F.normalize(cam_o.view(batch, -1), p=2, dim=-1)
-    cam_n = F.normalize(cam_n.view(batch, -1), p=2, dim=-1)
-    
-    loss_AD = (cam_o - cam_n).norm(p=1, dim=1).mean()
-    return loss_AD
-
-
 #### model for Ada Face 
 def prepare_adaface_vjal(args):
     architecture = "ir_18"
@@ -382,7 +312,7 @@ def prepare_adaface_vjal(args):
     model_statedict = {key[6:]:val for key, val in statedict.items() if key.startswith('model.')}
     model.load_state_dict(model_statedict)
     
-    model.to(my_device)
+    #model.to(my_device)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -451,6 +381,27 @@ def calculate_acc(preds, labels, args):
                                 np.std(accuracy), np.mean(thd)))
     return np.mean(accuracy), predicts
 
+
+def get_ckd_loss(std_emb, tea_emb, eps=1e-8, temp3=2.0):
+
+    batch_size = std_emb.shape[0]
+    labels = Variable(torch.LongTensor(range(batch_size))).to(std_emb.device)
+
+    if std_emb.dim() == 2:
+        std_emb = std_emb.unsqueeze(0)
+        tea_emb = tea_emb.unsqueeze(0)
+
+    std_emb_norm = torch.norm(std_emb, 2, dim=2, keepdim=True)
+    tea_emb_norm = torch.norm(tea_emb, 2, dim=2, keepdim=True)
+
+    scores0 = torch.bmm(std_emb, tea_emb.transpose(1, 2))
+    norm0 = torch.bmm(std_emb_norm, tea_emb_norm.transpose(1, 2))
+    scores0 = scores0 / norm0.clamp(min=eps) * temp3  ########()
+
+    # --> batch_size x batch_size
+    scores0 = scores0.squeeze()
+    loss0 = nn.CrossEntropyLoss()(scores0, labels)
+    return loss0 
 
 
 if __name__ == "__main__":
