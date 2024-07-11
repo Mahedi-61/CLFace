@@ -14,9 +14,6 @@ def l2_norm(input, axis=1):
     return output
 
 
-def get_CLS_embedding(layer):
-    return layer[:, 0, :]
-
 ############### Arc Face ##################### 
 def conv1x1(in_planes, out_planes, bias=False):
     "1x1 convolution with padding"

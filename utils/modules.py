@@ -28,7 +28,7 @@ def save_model(args, model, metric_fc):
     
     os.makedirs(save_dir, exist_ok=True)
 
-    name = 'l_%s_%s_ms1m_step%d.pth' % (args.model_type, args.arch, args.step) 
+    name = '50_%s_%s_%s_step%d.pth' % (args.model_type, args.arch, args.dataset, args.step) 
     
     state_path = os.path.join(save_dir, name)
     state = {'model': model.state_dict(), 
@@ -44,34 +44,18 @@ def get_msd_loss(
     list_attentions_b,
     args):
 
-    """Pooled Output Distillation.
-    Reference:
-        * Douillard et al.
-          Small Task Incremental Learning.
-          arXiv 2020.
-
-    :param list_attentions_a: A list of attention maps, each of shape (b, n, w, h).
-    :param list_attentions_b: A list of attention maps, each of shape (b, n, w, h).
-    :param collapse_channels: How to pool the channels.
-    :return: A float scalar loss.
-    """
-    normalize=True
-    collapse_channels="channels"
-    
+    normalize=True    
     assert len(list_attentions_a) == len(list_attentions_b)
     loss = torch.tensor(0.).to(args.my_device)
 
     for a, b in zip(list_attentions_a, list_attentions_b):
         assert a.shape == b.shape, (a.shape, b.shape)
 
-        #a = torch.pow(a, 2)
-        #b = torch.pow(b, 2)
+        a = torch.pow(a, 2)
+        b = torch.pow(b, 2)
 
-        if collapse_channels == "channels":
-            a = a.sum(dim=1).view(a.shape[0], -1)  # shape of (b, w * h)
-            b = b.sum(dim=1).view(b.shape[0], -1)
-        else:
-            raise ValueError("Unknown method to collapse: {}".format(collapse_channels))
+        a = a.sum(dim=1).view(a.shape[0], -1)  # shape of (b, w * h)
+        b = b.sum(dim=1).view(b.shape[0], -1)
 
         if normalize:
             a = F.normalize(a, dim=1, p=2)
@@ -94,14 +78,6 @@ def get_gpkd(global_feats, global_feats_old, args):
     
 
 ############   features   ############
-def get_shared_features_arcface(backbone, shared_net, imgs):
-    x = backbone(imgs)
-    img_features = shared_net(x)
-    feat = shared_net.module[0](x)
-    feat.requires_grad_(True) 
-    return img_features, feat 
-
-
 def get_tpr(fprs, tprs):
     fpr_val = [10 ** -4, 10 ** -3]
     tpr_fpr_row = []
@@ -278,7 +254,7 @@ def prepare_adaface_pretrained(args):
 
 
 
-#######lossess ##########333
+#######lossess ##########
 def kl_div(n_img, out, prev_out, T=2):
     """
     Compute the knowledge-distillation (KD) loss with soft targets.
@@ -299,25 +275,6 @@ def kl_div(n_img, out, prev_out, T=2):
     res = torch.nn.functional.kl_div(log_p, q, reduction='none')
     res = res.sum() / n_img
     return res
-
-
-#### model for Ada Face 
-def prepare_adaface_vjal(args):
-    architecture = "ir_18"
-
-    args.load_model_path = args.adaface_path 
-    model = net.build_model(architecture)
-    
-    statedict = torch.load(args.load_model_path)['state_dict']
-    model_statedict = {key[6:]:val for key, val in statedict.items() if key.startswith('model.')}
-    model.load_state_dict(model_statedict)
-    
-    #model.to(my_device)
-    for p in model.parameters():
-        p.requires_grad = False
-    model.eval()
-    print("Loading pretrianed AdaFace model")
-    return model 
 
 
 def KFold(n, n_folds=10):
@@ -396,7 +353,7 @@ def get_ckd_loss(std_emb, tea_emb, eps=1e-8, temp3=2.0):
 
     scores0 = torch.bmm(std_emb, tea_emb.transpose(1, 2))
     norm0 = torch.bmm(std_emb_norm, tea_emb_norm.transpose(1, 2))
-    scores0 = scores0 / norm0.clamp(min=eps) * temp3  ########()
+    scores0 = scores0 / (norm0.clamp(min=eps) * temp3)
 
     # --> batch_size x batch_size
     scores0 = scores0.squeeze()

@@ -13,18 +13,20 @@ from models import focal_loss
 from utils.modules import * 
 
 
-
 class BaseTrainer:
     def __init__(self, args):
         self.args = args
         self.my_device = torch.device('cuda:%d' % self.args.gpu_id 
-                                      if torch.cuda.is_available() else 'cpu')
+                                    if torch.cuda.is_available() else 'cpu')
 
         self.args.my_device = self.my_device 
-        num = args.num_classes // 2 
+        num = int(args.num_classes * args.base_fraction)
         self.base_num = num - (num % args.step_size)
-        self.class_range = self.base_num // args.step_size 
-        
+
+        remain_classes = args.num_classes - self.base_num
+        remain_classes = remain_classes - (remain_classes % args.step_size)
+
+        self.class_range = remain_classes // args.step_size 
         self.args.base_num = self.base_num
         self.args.class_range = self.class_range
         self.val_acc = 0
@@ -52,7 +54,7 @@ class BaseTrainer:
     def get_dataloaders(self, ):
         if self.args.train == True:
             self.args.split = "train"
-            train_ds = TrainDataset(self.args) 
+            train_ds = TrainDataset(self.args, ckd_data = False) 
             self.args.train_size = train_ds.__len__()
 
             self.train_dl = torch.utils.data.DataLoader(
@@ -84,7 +86,17 @@ class BaseTrainer:
 
 
     def get_optimizer(self, ):
-        ss = 25 if self.args.is_base == True else 3
+        if self.args.is_base == True:
+            if self.args.dataset == "ms1m": ss = int(50 * self.args.base_fraction)
+            elif self.args.dataset == "WF12M": ss = int(100 * self.args.base_fraction)
+            print("base scheduler step interval: ", ss)
+
+        else:
+            if self.args.dataset == "ms1m" or self.args.dataset == "vgg":
+                ss = int(1.5 / self.args.base_fraction)
+                if self.args.base_fraction == 0.10: ss -= 5
+                print("fine-tuning scheduler step interval: ", ss)
+
         lr_new = self.args.lr_train if self.args.is_base == True else 0.01
 
         self.optimizer = torch.optim.SGD(self.model.parameters(), 

@@ -97,7 +97,7 @@ class LwM (BaseTrainer):
             loop.update(1)
             loop.set_description(f'Training Epoch [{self.args.current_epoch + 1}/{self.args.max_epoch}]')
             loop.set_postfix()
-            break 
+ 
 
         loop.close()
         print("total loss {:0.7f}".format(total_loss / self.args.train_size))

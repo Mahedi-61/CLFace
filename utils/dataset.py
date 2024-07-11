@@ -12,18 +12,19 @@ from utils.utils import *
 ################################################################
 
 class TrainDataset():
-    def __init__(self, args):
+    def __init__(self, args, ckd_data):
         print("\nLoading %s dataset: " % args.split)
         self.data_dir = os.path.join("./data", args.dataset)
         self.model_type = args.model_type
-        self.filenames, self.sub_imgs, self.class_id = get_imgs_dir(self.data_dir, args)
+        self.filenames, self.sub_imgs, self.class_id = get_imgs_dir(self.data_dir, args, ckd_data)
         self.args = args
+        self.ckd_data = ckd_data 
 
     def __len__(self):
         return len(self.filenames)
 
     def __getitem__(self, index):
-        if not self.args.is_base: 
+        if self.ckd_data: 
             idx = index % self.args.class_range
             img_list = self.sub_imgs[idx]
             cls_list = self.class_id[idx]
@@ -32,9 +33,9 @@ class TrainDataset():
             img_name = img_list[rand_id]
             cls_id = cls_list[rand_id]   
 
-        elif self.args.is_base:
-            self.filenames[index]
-            self.class_id[index]
+        elif not self.ckd_data:
+            img_name = self.filenames[index]
+            cls_id = self.class_id[index]
 
         imgs = get_transform_img(img_name, "train", self.model_type)
         return imgs, torch.tensor(cls_id) 
@@ -47,7 +48,6 @@ class TestDataset:
 
         print("Loading %s dataset: %s" % (args.split, args.test_dataset))
         self.imgs_pair, self.pair_label = self.get_test_list(args.ver_list)
-
 
     def get_test_list(self, test_ver_list):
         with open(test_ver_list, 'r') as fd:

@@ -1,35 +1,12 @@
 import os
-import errno
 import numpy as np
 import torch
 import yaml
 from easydict import EasyDict as edict
 import datetime
-import dateutil.tz
 from PIL import Image 
 from albumentations.pytorch import ToTensorV2
 import albumentations as A 
-
-# config
-def get_time_stamp():
-    now = datetime.datetime.now(dateutil.tz.tzlocal())
-    timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')  
-    return timestamp
-
-
-def load_yaml(filename):
-    with open(filename, 'r') as f:
-        cfg = edict(yaml.load(f, Loader=yaml.FullLoader))
-    return cfg
-
-
-def merge_args_yaml(args):
-    if args.cfg_file is not None:
-        opt = vars(args)
-        args = load_yaml(args.cfg_file)
-        args.update(opt)
-        args = edict(args)
-    return args
 
 
 def get_transform_img(img_path, split, model_type="arcface"):
@@ -74,7 +51,7 @@ def do_flip_test_images(img_path, model_type="arcface"):
     return img
 
 
-def get_imgs_dir(data_dir, args):
+def get_imgs_dir(data_dir, args, ckd_data):
     img_dir = os.path.join(data_dir, "images")
     sub_ls = sorted(os.listdir(img_dir), key= lambda x: int(x))
     
@@ -105,7 +82,10 @@ def get_imgs_dir(data_dir, args):
         if args.step == 0:
             all_labels += [int(sub)] * len(sub_imgs_dir) 
         else:
-            all_labels += [[int(sub) - args.base_num] * len(sub_imgs_dir)] 
+            if ckd_data:
+                all_labels += [[int(sub) - args.base_num] * len(sub_imgs_dir)] 
+            if not ckd_data:
+                all_labels += [int(sub) - args.base_num] * len(sub_imgs_dir) 
 
     if args.step == 0:
         print("Labels: %d, %d ..... %d, %d" % 
@@ -159,9 +139,11 @@ def load_shared_model(shared_net, model_path):
 
 
 if __name__ == "__main__":
+    print("May Allah help me!")
     from easydict import EasyDict
     args = EasyDict()
-    args.step = 5
-    args.class_range= 8574
+    args.step = 10
+    args.base_num = 42870
+    args.class_range= 4287
     data_dir = "./data/ms1m"
     get_imgs_dir(data_dir, args)
