@@ -4,7 +4,7 @@ RUN THE CODE
 python3 src/main.py --train --is_base --arch 50 --setup finetune 
 
 # for clface or finetune
-python3 src/main.py --train --is_base --add_ckd --setup clface --arch 50 --step_size 5 --base_fraction 0.50 --saved_model_path g_arcface_50_ms1m_step5.pt
+python3 src/main.py --train --is_base --add_ckd --setup clface --arch 50 --step_size 5 --base_fraction 0.50 --saved_model_path 50_arcface_50_ms1m_step5.pth
 """
 
 import os, sys, random
@@ -21,6 +21,8 @@ sys.path.insert(0, ROOT_PATH)
 from base_train import BaseTrainer 
 from train import CLFace
 from LwM import LwM
+from eval_tinyface import evaluate_tinyface
+from eval_ijb import evaluate_ijb
 
 
 def parse_arguments(argv):
@@ -39,11 +41,11 @@ def parse_arguments(argv):
     parser.add_argument('--step',          type=int,   default=1,          help="incremental current step")
     parser.add_argument('--step_size',     type=int,   default=5,          help='total incremental steps')
     parser.add_argument('--freeze',        type=int,   default=0,          help='Number of epoch pretrained model frezees')
-    parser.add_argument('--setup',         type=str,   default="finetune", help='finetune | clface | lwm')
+    parser.add_argument('--setup',         type=str,   default="clface",   help='finetune | clface | lwm')
     parser.add_argument('--base_fraction', type=float, default=0.50,       help='base fraction 0.10 | 0.25 | 0.50 | 0.75')
 
-    parser.add_argument('--dataset',       type=str,   default="WF12M",    help='Name of the datasets ms1m | vgg | WF12M')
-    parser.add_argument("--test_dataset",  type=str,   default="WF12M_test",   help="Name of the test dataset")
+    parser.add_argument('--dataset',       type=str,   default="ms1m",    help='Name of the datasets ms1m | vgg | WF12M')
+    parser.add_argument("--test_dataset",  type=str,   default="ms1m_test",   help="Name of the test dataset")
     parser.add_argument('--batch_size',    type=int,   default=256,        help='Batch size') #256
     parser.add_argument('--max_epoch',     type=int,   default=9,          help='Maximum epochs') #20
     parser.add_argument('--model_type',    type=str,   default="arcface",  help='architecture of the model: arcface | adaface')
@@ -56,8 +58,8 @@ def parse_arguments(argv):
     parser.add_argument('--saved_model_path',   type=str,   default="50_arcface_50_WF12M_step0.pth", help='model pretrained on previous step')
 
     parser.add_argument('--final_dim',     type=int,     default=512,    help='weight value of the ITC loss')
-    parser.add_argument('--s',             type=float,   default=64.0,   help='weight value of the attribute loss')
-    parser.add_argument('--m',             type=float,   default=0.5,    help='weight value of the KD loss') 
+    parser.add_argument('--s',             type=float,   default=64.0,   help='arcface s')
+    parser.add_argument('--m',             type=float,   default=0.5,    help='arcface margin') 
     parser.add_argument('--gpu_id',        type=int,     default=0,      help='GPU ID') 
     return  parser.parse_args(argv)
 
@@ -133,7 +135,7 @@ if __name__ == "__main__":
 			t.train()
 
 	elif args.train == False:
-		for dataset in ['WF12M_test']: #'lfw', 'agedb', 'calfw', 'cfp_fp',  'cpl_fw'
+		for dataset in ['ijb-c']: #'lfw', 'agedb', 'calfw', 'cfp_fp',  'cpl_fw'
 			args.test_dataset = dataset
 
 			folder = args.saved_model_path.split("_")[-1].replace(".pth", "")
@@ -144,10 +146,29 @@ if __name__ == "__main__":
 							            folder, 
 							            args.saved_model_path)
 
-			if args.setup == "finetune": t = BaseTrainer(args)
-			elif args.setup == "clface": t = CLFace(args)
-			elif args.setup == "lwm": t = LwM(args)
-			val_acc[dataset] = t.test()
+			if dataset in ["tinyface", "ijb-b", "ijb-c"]:
+				if dataset == "tinyface":
+					evaluate_tinyface(args)
 
-		print("Best accuracies in all datasets ")
-		print(val_acc)
+				elif dataset == "ijb-b":
+					args.target = "IJBB"
+					evaluate_ijb(args)
+
+				elif dataset == "ijb-c":
+					args.target = "IJBC"
+					evaluate_ijb(args)
+			else:
+				if args.setup == "finetune": 
+					t = BaseTrainer(args)
+					val_acc[dataset] = t.test()
+
+				elif args.setup == "clface": 
+						t = CLFace(args)
+						val_acc[dataset] = t.test()
+
+				elif args.setup == "lwm": 
+					t = LwM(args)
+					val_acc[dataset] = t.test()
+
+			print("Best accuracies in all datasets ")
+			print(val_acc)

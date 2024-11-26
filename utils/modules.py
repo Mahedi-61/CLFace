@@ -95,7 +95,7 @@ def valid_epoch(valid_dl, model, args):
 
     loop = tqdm(total = len(valid_dl))
     cosine_sim = nn.CosineSimilarity(dim=1, eps=1e-6)
-
+    
     with torch.no_grad():
         for  data in valid_dl:
             img1, img2, img1_h, img2_h, pair_label = data 
@@ -106,7 +106,7 @@ def valid_epoch(valid_dl, model, args):
             img1_h = img1_h.to(args.my_device)
             img2_h = img2_h.to(args.my_device)
             pair_label = pair_label.to(args.my_device)
-
+        
             # get global and local image features from COTS model
             if args.model_type == "arcface":
                 global_feat1, l_2, l_3, l_4 = model(img1)
@@ -194,8 +194,10 @@ def prepare_arcface(args, ):
         print("Backbone network (fully trainable + No pretrain weights)")
 
     elif args.is_base == False:
-        checkpoint = torch.load(args.model_path)
+        checkpoint = torch.load(args.model_path, weights_only=True)
         model.load_state_dict(checkpoint['model'])
+        #checkpoint = torch.load("weights/pretrain/arcface_ir50_ms1mv3.pth", weights_only=True)
+        #model.load_state_dict(checkpoint)
         print("Loading saved backbone network weights from: ", args.model_path)
 
     return model
@@ -219,7 +221,7 @@ def prepare_margin(args, ):
         print("ArcFace network (fully trainable + No pretrain weights)")
 
     elif args.is_base == False:
-        checkpoint = torch.load(args.model_path)
+        checkpoint = torch.load(args.model_path, weights_only=True)
         metric_fc.load_state_dict(checkpoint['metric_fc'])
         print("Loading saved metric_fc weights from: ", args.model_path)
 

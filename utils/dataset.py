@@ -2,7 +2,7 @@ import os, sys, random
 import os.path as osp
 import argparse, itertools
 import torch  
-
+import os 
 ROOT_PATH = osp.abspath(osp.join(osp.dirname(osp.abspath(__file__)),  ".."))
 sys.path.insert(0, ROOT_PATH)
 from utils.utils import *
@@ -67,10 +67,11 @@ class TestDataset:
         imgs = self.imgs_pair[index]
         pair_label = self.pair_label[index]
 
+       
         data_dir = os.path.join(self.data_dir, "images")
         img1_path = os.path.join(data_dir, "test", imgs[0])
         img2_path = os.path.join(data_dir, "test",  imgs[1])
-
+        
         img1 = get_transform_img(img1_path, "test", self.model_type)
         img2 = get_transform_img(img2_path, "test", self.model_type)
 
@@ -80,7 +81,18 @@ class TestDataset:
         return img1, img2, img1_h, img2_h, pair_label
 
 
+
     def __len__(self):
         return len (self.imgs_pair)
     
 
+if __name__ == "__main__":
+    from types import SimpleNamespace
+    file = os.path.join(os.getcwd(), "data/lfw/images/test_pairs.txt")
+    args = SimpleNamespace(
+            test_dataset = "lfw",   
+            split = "test",
+            model_type = "arcface",
+            ver_list = file)
+    t = TestDataset(args)
+    t.__getitem__(0)

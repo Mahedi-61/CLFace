@@ -109,7 +109,7 @@ class CLFace:
                 ss = int(3 / self.args.base_fraction)
 
             if self.args.base_fraction == 0.10: ss -= 5
-            print("fine-tuning scheduler step interval: ", ss)
+            #print("fine-tuning scheduler step interval: ", ss)
 
         lr_new = self.args.lr_train if self.args.is_base == True else 0.0078
 

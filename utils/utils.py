@@ -14,8 +14,8 @@ def get_transform_img(img_path, split, model_type="arcface"):
 
     train_transforms = A.Compose([
         A.HorizontalFlip(p = 0.5),
-        A.Normalize(mean=torch.tensor([0.5412688 , 0.43232402, 0.37956172]), 
-                    std=torch.tensor([0.28520286, 0.2531577 , 0.24701026]),
+        A.Normalize(mean=[0.5412688 , 0.43232402, 0.37956172], 
+                    std=[0.28520286, 0.2531577 , 0.24701026],
                     always_apply=True),
         ToTensorV2()
     ])
